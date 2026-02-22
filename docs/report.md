@@ -30,7 +30,7 @@ Traditional intrusion detection systems (IDS) rely on signature-based detection 
 
 This project applies two machine learning approaches to the RT-IoT2022 dataset (Sharmila Kinnal et al., 2023), a real-time IoT network traffic dataset containing 123,117 labeled network flow records collected from a live IoT infrastructure. The first model is a deep neural network that classifies the attack type of a network flow from its 83 statistical features into one of 12 categories (8 attack types and 4 normal device traffic patterns). The second model is a stacked LSTM network that treats successive network flows as a time series and predicts the flow duration of the next flow — a regression target that can be used to flag anomalously long or short connections as potential attack indicators.
 
-The report proceeds as follows: Section 2 presents the full IoT system design with architecture diagram. Section 3 describes the dataset. Section 4 details the machine learning methods, architectures, training procedures, and results. Section 5 discusses conclusions and limitations.
+The report proceeds as follows: Section 2 presents the full IoT system design with architecture diagram. Section 3 describes the dataset. Section 4 presents exploratory data analysis, including class distribution, protocol patterns, TCP flag signatures, correlation structure, and PCA. Section 5 details the machine learning methods, architectures, training procedures, and results. Section 6 discusses conclusions and limitations.
 
 ---
 
@@ -110,7 +110,94 @@ The RT-IoT2022 dataset (Sharmila Kinnal et al., 2023) was assembled from a real-
 
 **Target variable:** `Attack_type` — a categorical label with 12 values representing 8 attack patterns (DOS_SYN_Hping, ARP_poisioning, NMAP_UDP_SCAN, NMAP_XMAS_TREE_SCAN, NMAP_OS_DETECTION, NMAP_TCP_scan, DDOS_Slowloris, Metasploit_Brute_Force_SSH, NMAP_FIN_SCAN) and 4 normal device traffic patterns (Thing_Speak, MQTT_Publish, Wipro_bulb, and the broader Amazon-Alexa category subsumed into device traffic). The dataset is severely imbalanced: DOS_SYN_Hping accounts for 94,659 of 123,117 records (76.9%), while NMAP_FIN_SCAN has only 28 records and Metasploit_Brute_Force_SSH has 37.
 
-The dataset contains no missing values. EDA and descriptive statistics were performed by a separate team member and are not reproduced here.
+The dataset contains no missing values. Full EDA is presented in Section 4.
+
+---
+
+## Exploratory Data Analysis
+
+Exploratory data analysis (EDA) was conducted in `eda.ipynb` (Yatharth Vardan) using pandas, NumPy, Matplotlib, and seaborn. The analysis covers dataset structure, class distribution, missing values, protocol and service patterns, TCP flag signatures, correlation structure, dimensionality reduction, and per-class feature distributions. Key findings are summarised below.
+
+### Dataset Structure and Quality
+
+The dataset comprises 123,117 rows and 85 columns (including the `index` identifier column and the `Attack_type` target). Of the 85 columns, 56 are `float64`, 26 are `int64`, and 3 are `object` (`proto`, `service`, `Attack_type`). Total in-memory footprint is 99.15 MB. No duplicate rows and no missing values were found across all 10,464,945 cells, confirming the dataset is complete and ready for modelling without imputation beyond the median imputation applied defensively in Model 1.
+
+### Class Distribution and Imbalance
+
+The 12 `Attack_type` classes are severely imbalanced, with a maximum-to-minimum class ratio of 3,380.68:1:
+
+| Attack Type | Count | Percentage |
+|---|---|---|
+| DOS_SYN_Hping | 94,659 | 76.89% |
+| Thing_Speak | 8,108 | 6.59% |
+| ARP_poisioning | 7,750 | 6.29% |
+| MQTT_Publish | 4,146 | 3.37% |
+| NMAP_UDP_SCAN | 2,590 | 2.10% |
+| NMAP_XMAS_TREE_SCAN | 2,010 | 1.63% |
+| NMAP_OS_DETECTION | 2,000 | 1.62% |
+| NMAP_TCP_scan | 1,002 | 0.81% |
+| DDOS_Slowloris | 534 | 0.43% |
+| Wipro_bulb | 253 | 0.21% |
+| Metasploit_Brute_Force_SSH | 37 | 0.03% |
+| NMAP_FIN_SCAN | 28 | 0.02% |
+
+*Table 3.* RT-IoT2022 class distribution across 123,117 records.
+
+The dominant class, DOS_SYN_Hping, alone accounts for 76.89% of all records, making this one of the most imbalanced published IoT security datasets. This imbalance directly motivates the use of inverse-frequency class weights in Model 1 and the log1p target transform in Model 2.
+
+### Attack Category Grouping
+
+For higher-level pattern analysis, the 12 fine-grained classes were grouped into four semantic categories:
+
+- **DOS/DDOS** (DOS_SYN_Hping, DDOS_Slowloris): 77.32% of records. Characterised by high SYN flag counts, extremely short flow durations, and near-exclusive TCP protocol use.
+- **Reconnaissance/Scanning** (NMAP_UDP_SCAN, NMAP_XMAS_TREE_SCAN, NMAP_OS_DETECTION, NMAP_TCP_scan, NMAP_FIN_SCAN): 6.18% of records. Distinguished by diverse TCP flag combinations (FIN, XMAS, RST) and low per-flow packet counts.
+- **IoT Device Traffic** (Thing_Speak, MQTT_Publish, Wipro_bulb): 10.17% of records. Exhibits longer flow durations, balanced forward/backward packet ratios, and device-specific services (mqtt, -).
+- **Network Attacks** (ARP_poisioning, Metasploit_Brute_Force_SSH): 6.32% of records. Variable flow characteristics with distinct protocol fingerprints.
+
+### Protocol and Service Analysis
+
+The dataset contains three transport protocols: TCP (dominant, used by DoS/DDoS and most NMAP variants), UDP (used by NMAP_UDP_SCAN), and ICMP (used by a small subset of flows). Ten distinct service labels are present; the most common are `-` (unknown/raw flows, predominantly DoS traffic) and `mqtt` (MQTT_Publish flows). A service-by-attack-type cross-tabulation confirms clean protocol-to-attack mappings: MQTT_Publish flows use exclusively the `mqtt` service, while DOS_SYN_Hping and most NMAP scans use the `-` service, reflecting raw TCP/UDP/ICMP traffic without application-layer identification.
+
+### Correlation Structure
+
+A correlation analysis of 21 key numerical features identified the following strongly correlated pairs (|r| > 0.7):
+
+- Forward and backward packet counts are highly correlated with their respective header size totals (expected, as header size is a linear function of packet count).
+- Forward inter-arrival time statistics (min, max, avg, std, tot) are mutually correlated, reflecting that IAT distributions are internally consistent.
+- `fwd_pkts_payload.tot` and `fwd_pkts_payload.avg` show strong positive correlation with forward subflow byte counts.
+- `flow_pkts_per_sec` and `bwd_pkts_per_sec` are closely correlated for symmetric flows.
+
+These correlations indicate redundancy among certain feature groups — a finding that motivates dimensionality reduction or feature selection in future work, though the DNN's hidden layers implicitly learn to de-weight redundant inputs.
+
+### TCP Flag Signatures
+
+TCP flag patterns provide the most discriminative signal between attack categories. Key observations from the mean flag counts by attack type:
+
+- **DOS_SYN_Hping** shows by far the highest mean SYN flag count, confirming its SYN-flood mechanism.
+- **DDOS_Slowloris** shows elevated ACK counts relative to SYN counts, reflecting its keep-alive connection exhaustion strategy.
+- **NMAP_XMAS_TREE_SCAN** and **NMAP_FIN_SCAN** uniquely exhibit non-zero FIN flags in the absence of a complete TCP handshake.
+- **MQTT_Publish** and **Thing_Speak** show balanced FIN and ACK flags, consistent with orderly TCP session teardown in legitimate IoT telemetry.
+- **ARP_poisioning** flows show near-zero TCP flag counts, consistent with ARP operating at Layer 2 below TCP.
+
+### Feature Distributions and Flow Characteristics
+
+Six key features were examined across attack types via boxplots and violin plots:
+
+- **Flow duration:** MQTT_Publish and Thing_Speak flows have the longest durations (tens of seconds, reflecting persistent MQTT keep-alive connections). DOS_SYN_Hping flows have near-zero median duration, consistent with SYN packets that do not complete a handshake. DDOS_Slowloris has the highest maximum duration (up to 21,728 s), reflecting its deliberate connection-holding strategy.
+- **Packets per second:** DOS_SYN_Hping achieves the highest median packet rate, consistent with flood-rate traffic generation. NMAP scans have moderate rates; IoT device traffic has the lowest.
+- **Forward/backward packet ratio:** IoT device classes exhibit higher and more balanced forward/backward ratios than attack classes, reflecting bidirectional data exchange in legitimate telemetry.
+- **Down/up ratio:** ARP_poisioning shows a distinctive down/up ratio pattern driven by its Layer 2 broadcast-request mechanism.
+
+### Principal Component Analysis
+
+PCA was applied to a stratified sample of 10,000 records (standardised over 81 numerical features). The first two principal components explain a combined variance of approximately 30–35%, reflecting the high intrinsic dimensionality of the 83-feature flow representation. In the 2D PCA projection:
+
+- DOS_SYN_Hping forms a compact, well-separated cluster, confirming its highly stereotyped statistical signature.
+- IoT device traffic classes (MQTT_Publish, Thing_Speak, Wipro_bulb) occupy a distinct region characterised by longer durations and higher payload sizes.
+- NMAP scan variants partially overlap with each other but are separable from DoS traffic.
+- Metasploit_Brute_Force_SSH and NMAP_FIN_SCAN project near the IoT device traffic region due to their TCP session characteristics, explaining the low precision for these classes in the DNN classifier.
+
+The PCA results confirm that the 83-dimensional feature space contains meaningful structure exploitable by machine learning, while also explaining why minority attack classes with small within-class variance are harder to separate precisely.
 
 ---
 
@@ -177,7 +264,7 @@ For multi-class imbalanced classification, accuracy alone is misleading — a mo
 | Macro F1-Score | 0.8495 |
 | Weighted F1-Score | 0.9886 |
 
-*Table 1.* Model 1 DNN attack classifier test-set performance metrics (24,624 test samples, 50 epochs, early stopping restored best weights from epoch 49).
+*Table 4.* Model 1 DNN attack classifier test-set performance metrics (24,624 test samples, 50 epochs, early stopping restored best weights from epoch 49).
 
 | Class | Precision | Recall | F1-Score | Support |
 |---|---|---|---|---|
@@ -194,7 +281,7 @@ For multi-class imbalanced classification, accuracy alone is misleading — a mo
 | Thing_Speak | 0.96 | 0.92 | 0.94 | 1,622 |
 | Wipro_bulb | 0.57 | 0.92 | 0.71 | 51 |
 
-*Table 2.* Model 1 per-class precision, recall, and F1-score on the test set.
+*Table 5.* Model 1 per-class precision, recall, and F1-score on the test set.
 
 The overall test accuracy of 98.79% and weighted F1 of 0.9886 demonstrate that the DNN classifier performs exceptionally well on the RT-IoT2022 dataset. The dominant class, DOS_SYN_Hping (76.9% of records), achieves perfect F1 of 1.00, confirming that its strong statistical signature (high SYN flag counts, short flow durations) is reliably captured by the network. The majority of other well-represented attack types — MQTT_Publish, NMAP_XMAS_TREE_SCAN, NMAP_OS_DETECTION, NMAP_TCP_scan — also achieve F1 scores above 0.97.
 
@@ -277,7 +364,7 @@ To address this, a `log1p` (natural logarithm of 1+x) transform is applied to `f
 | Test RMSE (seconds) | 8.3965 |
 | Test MAE (seconds) | 0.7940 |
 
-*Table 3.* Model 2 LSTM flow duration predictor test-set performance metrics (24,620 test sequences, log1p-transformed target).
+*Table 6.* Model 2 LSTM flow duration predictor test-set performance metrics (24,620 test sequences, log1p-transformed target).
 
 **Interpretation of results.** The MAE of 0.274 in log1p space is equivalent to a typical prediction error of roughly 31% in relative terms — meaning the model can predict the order-of-magnitude of the next flow's duration with reasonable accuracy. The RMSE of 0.627 in log space and the original-scale MAE of 0.79 seconds show the model is producing directionally useful predictions for the large majority of short-duration flows.
 
@@ -292,10 +379,11 @@ In a production deployment where flows are ordered by a continuous network clock
 This project presented a complete IoT intrusion detection system for the RT-IoT2022 dataset, spanning physical sensor design, edge and cloud architecture, and two complementary machine learning models.
 
 **Key findings:**
-1. The RT-IoT2022 dataset's 83 network flow features provide a rich basis for machine learning-based intrusion detection, capturing packet-level, byte-level, and temporal statistics across diverse IoT device types.
-2. The DNN classifier achieved 98.79% test accuracy and a weighted F1-score of 0.9886 across 12 traffic classes. For the dominant DOS_SYN_Hping class and all well-represented NMAP scan variants, the model achieved perfect or near-perfect F1. Class weighting is essential: without it, the model would collapse to predicting the majority class, but with it, even rare attacks like Metasploit_Brute_Force_SSH (7 test samples) achieve 100% recall.
-3. The LSTM flow duration predictor achieves a test MAE of 0.274 log1p-seconds and 0.79 seconds on the original scale, demonstrating that next-flow duration is partially predictable from the preceding 20-flow sequence. The negative R² reflects the dataset's class-contiguous ordering rather than a continuous temporal clock, which causes the LSTM to encounter distribution-shift boundary effects at class transitions. In a clock-ordered production deployment, this limitation would not apply.
-4. The two models address fundamentally different prediction tasks — categorical attack classification (98.79% accuracy) and continuous temporal regression (MAE 0.79 s) — demonstrating the multi-faceted nature of IoT security monitoring and the value of ensemble detection strategies.
+1. EDA confirmed that the RT-IoT2022 dataset is complete (no missing values, no duplicates) and severely imbalanced (DOS_SYN_Hping: 76.89%, class imbalance ratio 3,380:1). TCP flag patterns, flow duration, and packet rate are the most discriminative features across attack categories. PCA reveals compact, well-separated clusters for DoS and IoT device traffic, while NMAP scan variants and rare attacks partially overlap — consistent with the DNN's precision limitations on minority classes.
+2. The RT-IoT2022 dataset's 83 network flow features provide a rich basis for machine learning-based intrusion detection, capturing packet-level, byte-level, and temporal statistics across diverse IoT device types.
+3. The DNN classifier achieved 98.79% test accuracy and a weighted F1-score of 0.9886 across 12 traffic classes. For the dominant DOS_SYN_Hping class and all well-represented NMAP scan variants, the model achieved perfect or near-perfect F1. Class weighting is essential: without it, the model would collapse to predicting the majority class, but with it, even rare attacks like Metasploit_Brute_Force_SSH (7 test samples) achieve 100% recall.
+4. The LSTM flow duration predictor achieves a test MAE of 0.274 log1p-seconds and 0.79 seconds on the original scale, demonstrating that next-flow duration is partially predictable from the preceding 20-flow sequence. The negative R² reflects the dataset's class-contiguous ordering rather than a continuous temporal clock, which causes the LSTM to encounter distribution-shift boundary effects at class transitions. In a clock-ordered production deployment, this limitation would not apply.
+5. The two models address fundamentally different prediction tasks — categorical attack classification (98.79% accuracy) and continuous temporal regression (MAE 0.79 s) — demonstrating the multi-faceted nature of IoT security monitoring and the value of ensemble detection strategies.
 
 **Limitations:**
 - **Class imbalance:** Despite class weighting, extremely rare classes (Metasploit_Brute_Force_SSH, NMAP_FIN_SCAN) may achieve poor recall due to insufficient training examples. Synthetic oversampling (SMOTE) could be investigated as a future improvement.
